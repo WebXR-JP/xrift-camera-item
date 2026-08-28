@@ -1,6 +1,6 @@
 # Cine Drone Camera（XRift アイテム）
 
-XRift のワールドに置く自律飛行型の撮影ドローンです。その場にいる人を自動で追跡し、動きや注目度を見てカットを切り替えながら飛び回ります。ドローン視点の映像は現場モニタにリアルタイムで表示され、REC ボタン一つで `.webm` 動画として保存できます。
+XRift のワールドに置く自律飛行型の撮影ドローンです。その場にいる人を自動で追跡し、動きや注目度を見てカットを切り替えながら飛び回ります。ドローン視点の映像は現場モニタにリアルタイムで表示され、REC ボタン一つで `.mp4` / `.webm` 動画として保存できます。
 
 ![Cine Drone Camera の録画サンプル](docs/demo.gif)
 
@@ -87,7 +87,7 @@ import { Item } from '@xrift/recording-camera'
 - **MODE** — 次のモード名を面に表示してから切り替え
 - **NEXT ▶** — 次の人へフォーカス（`PIN` に入る）
 - **CUT** — 次のカットへ即座に切り替え
-- **REC** — `● REC` / `■ STOP` を切り替え。停止すると手元端末に `.webm` を保存
+- **REC** — `● REC` / `■ STOP` を切り替え。停止すると手元端末に動画（`.mp4` または `.webm`）を保存
 
 ## 同期の仕組み
 
@@ -108,13 +108,21 @@ import { Item } from '@xrift/recording-camera'
 ## 録画の仕組み
 
 ```
-WebGL レンダーターゲット → readRenderTargetPixelsAsync（PBO）→ 2D canvas 合成
-  → captureStream → MediaRecorder → .webm
+WebGL レンダーターゲット → readRenderTargetPixelsAsync（PBO）→ 2D canvas 合成 → 録画
 ```
+
+録画の出口は環境に応じて 2 系統から自動選択されます:
+
+| 経路 | 出力 | 選ばれる環境 |
+|---|---|---|
+| WebCodecs（`VideoEncoder`）+ [mp4-muxer](https://www.npmjs.com/package/mp4-muxer) | `.mp4`（H.264） | Chrome / Edge など WebCodecs がある環境（既定） |
+| MediaRecorder `video/mp4` | `.mp4` | Safari など MediaRecorder が mp4 を出せる環境 |
+| MediaRecorder | `.webm`（VP9 → VP8） | 上記が使えない環境のフォールバック |
 
 - 録画は**映像のみ**。音声トラックは含みません（理由は後述）
 - 録画ファイルは各クライアントのローカルに保存され、他の参加者には共有されません
-- 対応フォーマットは VP9 → VP8 → WebM → MP4 の順で自動選択されます
+- Chrome 系では MediaRecorder が `video/mp4` をサポートしないため、H.264 エンコードを WebCodecs で自前で行い mp4-muxer でコンテナに詰めます（[src/camera/mp4Recorder.ts](src/camera/mp4Recorder.ts)）
+- 録画 fps は `recordFps` / `quality` プリセットに従い、フレームのタイムスタンプは実時間ベースで渡すため描画の揺れがあっても再生速度は狂いません
 
 ## 音声を扱わない理由
 

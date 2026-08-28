@@ -51,6 +51,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@xrift/world-components": "^0.47.0"
+    "@xrift/world-components": "^0.47.0",
+    "mp4-muxer": "5.2.2"
   }
 }

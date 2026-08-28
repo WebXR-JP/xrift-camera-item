@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { WebGLRenderer } from 'three'
 import type { CameraFeed } from './useCameraFeed'
+import { createMp4Session, mp4SupportedSync, type Mp4Session } from './mp4Recorder'
 
 // 音声トラックは載せないので、コンテナにも音声コーデックを宣言しない。
 // 宣言だけして中身が来ないと、プレイヤーによっては待たされたり壊れて見える
@@ -11,9 +12,38 @@ const MIME_CANDIDATES = [
   'video/mp4',
 ]
 
-const pickMime = (): string | null => {
-  if (typeof MediaRecorder === 'undefined') return null
+/**
+ * 録画フォーマットの優先順。
+ *
+ * 1. WebCodecs + mp4-muxer（Chrome 系。mp4 で出せる）
+ * 2. MediaRecorder の video/mp4（Safari など）
+ * 3. MediaRecorder の webm（mp4 が一切使えない環境）
+ *
+ * MediaRecorder は Chrome でも isTypeSupported('video/mp4') が偽なので、
+ * mp4 を選ぶかどうかは WebCodecs の有無で決まる。
+ */
+const pickMode = (): 'mp4-webcodecs' | 'media-mp4' | 'media-webm' => {
+  if (mp4SupportedSync()) return 'mp4-webcodecs'
+  if (typeof MediaRecorder === 'undefined') return 'media-webm'
   for (const m of MIME_CANDIDATES) {
+    try {
+      if (MediaRecorder.isTypeSupported(m)) {
+        return m.indexOf('mp4') >= 0 ? 'media-mp4' : 'media-webm'
+      }
+    } catch {
+      /* 実装によっては投げる */
+    }
+  }
+  return 'media-webm'
+}
+
+/**
+ * MediaRecorder の webm 系 MIME を選ぶ。mp4 が WebCodecs 経路で賄われるので、
+ * ここに mp4 は載せない（Safari の MediaRecorder mp4 は media-mp4 で直接指定する）。
+ */
+const pickMediaMime = (): string | null => {
+  for (const m of MIME_CANDIDATES) {
+    if (m.indexOf('mp4') >= 0) continue
     try {
       if (MediaRecorder.isTypeSupported(m)) return m
     } catch {
@@ -34,6 +64,8 @@ const stamp = (): string => {
 
 export interface Recorder {
   supported: boolean
+  /** 今の環境で録画が mp4 になるか（false なら webm） */
+  mp4: boolean
   recording: boolean
   elapsedMs: number
   error: string | null
@@ -50,23 +82,28 @@ export interface Recorder {
 }
 
 /**
- * ドローン視点をそのまま .webm に落とす。
+ * ドローン視点をそのまま動画ファイルに落とす。
  *
- * WebGL のレンダーターゲット -> 非同期リードバック -> 2D キャンバス -> captureStream
- * -> MediaRecorder、という経路。リードバックが同期版だと GPU パイプラインが
- * 止まるので readRenderTargetPixelsAsync（WebGL2 の PBO）を使う。
+ * WebGL のレンダーターゲット -> 非同期リードバック -> 2D キャンバス -> 録画、という経路。
+ * 録画は環境に応じて 2 系統から選ぶ:
+ *  - WebCodecs (VideoEncoder) + mp4-muxer -> .mp4（Chrome 系の既定）
+ *  - MediaRecorder -> .webm（上記が使えない環境のフォールバック）
+ * リードバックが同期版だと GPU パイプラインが止まるので
+ * readRenderTargetPixelsAsync（WebGL2 の PBO）を使う。
  *
- * 音声は入れない（映像のみの .webm になる）。
+ * 音声は入れない（映像のみになる）。
  */
 export const useRecorder = (fps: number): Recorder => {
   const [recording, setRecording] = useState(false)
 
   const rec = useMemo<Recorder>(() => {
+    const mode = pickMode()
     const supported =
-      typeof MediaRecorder !== 'undefined' &&
-      typeof document !== 'undefined' &&
-      typeof HTMLCanvasElement !== 'undefined' &&
-      typeof HTMLCanvasElement.prototype.captureStream === 'function'
+      (mode === 'mp4-webcodecs' ||
+        (typeof MediaRecorder !== 'undefined' &&
+          typeof HTMLCanvasElement !== 'undefined' &&
+          typeof HTMLCanvasElement.prototype.captureStream === 'function')) &&
+      typeof document !== 'undefined'
 
     let out: HTMLCanvasElement | null = null
     let outCtx: CanvasRenderingContext2D | null = null
@@ -75,6 +112,7 @@ export const useRecorder = (fps: number): Recorder => {
     let image: ImageData | null = null
     let buffer: Uint8Array | null = null
     let recorder: MediaRecorder | null = null
+    let mp4: Mp4Session | null = null
     let chunks: Blob[] = []
     let startedAt = 0
     let inFlight = false
@@ -119,8 +157,32 @@ export const useRecorder = (fps: number): Recorder => {
       chunks = []
     }
 
+    /** WebCodecs 経路の締め処理。finish は非同期なのでダウンロードだけ先に済ませない */
+    const finishMp4 = async () => {
+      const session = mp4
+      mp4 = null
+      if (!session) return
+      try {
+        const blob = await session.finish()
+        if (!blob) {
+          api.error = 'mp4 encode failed'
+          return
+        }
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `xrift-drone-cam-${stamp()}.mp4`
+        a.rel = 'noopener'
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(url), 30000)
+      } catch (e) {
+        api.error = e instanceof Error ? e.message : 'download failed'
+      }
+    }
+
     const api: Recorder = {
       supported,
+      mp4: mode === 'mp4-webcodecs' || mode === 'media-mp4',
       recording: false,
       elapsedMs: 0,
       error: null,
@@ -138,8 +200,24 @@ export const useRecorder = (fps: number): Recorder => {
           api.error = 'canvas 2d unavailable'
           return
         }
-        const mime = pickMime()
+        startedAt = performance.now()
+        api.recording = true
+        api.error = null
+
+        if (mode === 'mp4-webcodecs') {
+          const session = createMp4Session(feed.width, feed.height, fps)
+          if (!session) {
+            api.error = 'WebCodecs unavailable'
+            api.recording = false
+            return
+          }
+          mp4 = session
+          setRecording(true)
+          return
+        }
+
         try {
+          const mime = mode === 'media-mp4' ? 'video/mp4' : pickMediaMime()
           const stream = out!.captureStream(fps)
           recorder = mime
             ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6_000_000 })
@@ -150,13 +228,11 @@ export const useRecorder = (fps: number): Recorder => {
           }
           recorder.onstop = finish
           recorder.start(1000)
-          startedAt = performance.now()
-          api.recording = true
-          api.error = null
           setRecording(true)
         } catch (e) {
           api.error = e instanceof Error ? e.message : 'record failed'
           recorder = null
+          api.recording = false
         }
       },
 
@@ -164,6 +240,10 @@ export const useRecorder = (fps: number): Recorder => {
         if (!api.recording) return
         api.recording = false
         setRecording(false)
+        if (mp4) {
+          void finishMp4()
+          return
+        }
         try {
           recorder?.stop()
         } catch {
@@ -204,6 +284,7 @@ export const useRecorder = (fps: number): Recorder => {
           outCtx.drawImage(raw!, 0, 0)
           outCtx.restore()
           if (hud) outCtx.drawImage(hud, 0, 0, out.width, out.height)
+          if (mp4) mp4.add(out, nowMs)
         }
 
         try {
@@ -231,6 +312,7 @@ export const useRecorder = (fps: number): Recorder => {
 
       dispose: () => {
         api.stop()
+        mp4 = null
         out = null
         raw = null
         outCtx = null
