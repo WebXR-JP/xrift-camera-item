@@ -3,7 +3,7 @@
     "distDir": "./dist",
     "buildCommand": "npm run build",
     "title": "Cine Drone Camera",
-    "description": "その場にいる人を自動で追いかけ、話している人にカットを切り替えながら飛び回る撮影ドローン。現場モニタ付きで、その映像をそのまま webm に録画できます。",
+    "description": "その場にいる人を自動で追跡し、動きと注目度を見てカットを切り替えながら飛び回る撮影ドローン。現場モニタ付きで、その映像をそのまま webm に録画できます。",
     "thumbnailPath": "thumbnail.png",
     "ignore": [
       "**/.DS_Store",
