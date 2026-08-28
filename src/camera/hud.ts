@@ -31,6 +31,8 @@ export interface HudModel {
   nowMs: number
   mode: string
   shotLabel: string
+  /** 4 分割マルチビュー表示中（閲覧者ごとのローカル状態） */
+  split: boolean
   recording: boolean
   recElapsedMs: number
   recSupported: boolean
@@ -275,10 +277,10 @@ export class Viewfinder {
     ctx.textAlign = 'right'
     ctx.fillStyle = WHITE
     ctx.font = `700 ${Math.round(15 * u)}px ${MONO}`
-    ctx.fillText(model.shotLabel, W - 26 * u, y)
+    ctx.fillText(model.split ? '4-SPLIT' : model.shotLabel, W - 26 * u, y)
     ctx.fillStyle = CYAN
     ctx.font = `600 ${Math.round(10 * u)}px ${MONO}`
-    ctx.fillText(model.mode, W - 26 * u, y + 13 * u)
+    ctx.fillText(model.split ? 'MULTIVIEW' : model.mode, W - 26 * u, y + 13 * u)
     ctx.restore()
   }
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useInstanceState, useUsers } from '@xrift/world-components'
-import { CAMERA_MODES, type CameraMode, type DirectorState, type Subject } from './types'
+import { CAMERA_MODES, type CameraMode, type CutTransition, type DirectorState, type Subject } from './types'
 import { DIRECTOR, MOTION } from './constants'
 import { mulberry32, pickWeighted, lerp } from './math'
 import { SHOTS, SHOT_BY_ID, moverOf, type ShotDef } from './shots'
@@ -13,6 +13,7 @@ const INITIAL: DirectorState = {
   duration: 6000,
   seed: 1,
   mode: 'auto',
+  transition: 'fly',
   pinned: '',
   rev: 0,
 }
@@ -55,6 +56,17 @@ export interface Director {
   nextMode: CameraMode
   /** このクライアントがカットを決める役かどうか */
   isDirector: boolean
+  /** カットの切り替わり方（フレーム精度） */
+  transition: CutTransition
+  /** レンダー用の transition */
+  uiTransition: CutTransition
+  /** カットの切り替わり方を変える。以降のカットすべてに効く */
+  setTransition(t: CutTransition): void
+  /**
+   * 直前の update で「ハードカット」が起きていたかを読んで消す。
+   * Item 側は true が返ったフレームでカメラを理想姿勢へ一瞬で送る。
+   */
+  consumeSnap(): boolean
   /** フレームに入れる被写体（先頭が主役） */
   cast: Subject[]
   primary: Subject | null
@@ -95,10 +107,14 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
   // 書いた瞬間にこちらも更新し、リモートからの変更は effect で追う。
   const [uiMode, setUiMode] = useState<CameraMode>(defaultMode)
   const [uiPinned, setUiPinned] = useState('')
+  const [uiTransition, setUiTransition] = useState<CutTransition>(
+    INITIAL.transition,
+  )
   useEffect(() => {
     setUiMode(state.mode)
     setUiPinned(state.pinned ?? '')
-  }, [state.mode, state.pinned])
+    setUiTransition(state.transition ?? 'fly')
+  }, [state.mode, state.pinned, state.transition])
 
   const setStateRef = useRef(setState)
   setStateRef.current = setState
@@ -138,11 +154,14 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
     let subjectChangedAt = 0
     let lastCutAt = 0
     let firstUpdateAt = 0
+    /** 直前の update でカットが起きたか。Item 側がカメラのスナップ判定に使う */
+    let snapRequest = false
 
     const apply = (next: DirectorState) => {
       stateRef.current = next
       setUiMode(next.mode)
       setUiPinned(next.pinned ?? '')
+      setUiTransition(next.transition ?? 'fly')
       setStateRef.current(next)
     }
 
@@ -266,6 +285,9 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
         mode,
         rev: stateRef.current.rev + 1,
       })
+      // ハードカットの印。Item 側がこれを見てカメラを理想姿勢へ一瞬で送る。
+      // rev を見ているので、カットが起きたクライアント以外には効かない
+      snapRequest = (stateRef.current.transition ?? 'fly') === 'cut'
     }
 
     const self: Director = {
@@ -277,6 +299,8 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
       uiPinnedId: null,
       nextMode: 'action',
       isDirector: true,
+      transition: INITIAL.transition,
+      uiTransition: INITIAL.transition,
       cast,
       primary: null,
       startedAt: 0,
@@ -323,11 +347,24 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
         apply({ ...stateRef.current, startedAt: 0, rev: stateRef.current.rev + 1 })
       },
 
+      setTransition: (t) => {
+        const st = stateRef.current
+        if ((st.transition ?? 'fly') === t) return
+        apply({ ...st, transition: t, rev: st.rev + 1 })
+      },
+
+      consumeSnap: () => {
+        const v = snapRequest
+        snapRequest = false
+        return v
+      },
+
       update: (nowMs, tracker) => {
         const st = stateRef.current
         self.mode = st.mode
         self.pinnedId = st.pinned || null
         self.isDirector = isDirectorRef.current
+        self.transition = st.transition ?? 'fly'
         self.nextMode =
           CAMERA_MODES[(CAMERA_MODES.indexOf(st.mode) + 1) % CAMERA_MODES.length]
 
@@ -427,6 +464,7 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
   // レンダー時点の値を載せ直す（ボタンのハイライトはこれを見る）
   director.uiMode = uiMode
   director.uiPinnedId = uiPinned || null
+  director.uiTransition = uiTransition
 
   return director
 }

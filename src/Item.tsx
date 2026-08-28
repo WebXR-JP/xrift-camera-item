@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import {
   Frustum,
@@ -23,6 +23,7 @@ import { useSubjects } from './camera/useSubjects'
 import { useDirector } from './camera/useDirector'
 import { useDroneRig } from './camera/useDroneRig'
 import { useCameraFeed } from './camera/useCameraFeed'
+import { useMultiviewFeed, assignChannels, channelPose } from './camera/multiview'
 import { useRecorder } from './camera/useRecorder'
 import { useSafeClock, useSafeItemId, useSafePlacement } from './camera/platform'
 import { applySafety, correctFraming, parkPose, type ShotContext } from './camera/shots'
@@ -82,7 +83,7 @@ const trimName = (name: string): string =>
  * atlas のコマ割り。0 と 1 は状態で書き換わる、それ以外は 1 回書いたら変わらない。
  * chip から CAMERA_MODES.length 個ぶんがモードのチップ。
  */
-const SLOT = { mode: 0, rec: 1, cut: 2, next: 3, prev: 4, chip: 5 } as const
+const SLOT = { mode: 0, rec: 1, cut: 2, next: 3, prev: 4, view: 5, chip: 6 } as const
 
 /**
  * 操作パネルに貼る文字の一式。
@@ -97,6 +98,7 @@ const makePanelTextures = () => {
   atlas.set(SLOT.cut, 'CUT', 'カットを変える')
   atlas.set(SLOT.next, 'NEXT ▶', '次の人')
   atlas.set(SLOT.prev, '◀ PREV', '前の人')
+  atlas.set(SLOT.view, '4-SPLIT', '全カメラを見る')
   CAMERA_MODES.forEach((m, i) => atlas.set(SLOT.chip + i, MODE_SHORT[m], MODE_HINT[m]))
   return {
     atlas,
@@ -108,6 +110,8 @@ const makePanelTextures = () => {
     }),
     /** モニタ下の「今フォーカスしている人」表示 */
     focusPanel: new TextPanel(768, 96),
+    /** カットの切り替わり方の帯（瞬時 / 移動） */
+    transitionPanel: new TextPanel(768, 96),
     /** 台座のステータス表示 */
     status: new TextPanel(640, 128),
   }
@@ -119,6 +123,7 @@ const disposePanelTextures = (ui: PanelTextures): void => {
   ui.atlas.dispose()
   ui.labelMaterial.dispose()
   ui.focusPanel.dispose()
+  ui.transitionPanel.dispose()
   ui.status.dispose()
 }
 
@@ -204,7 +209,12 @@ export const Item = ({
   const rig = useDroneRig()
   const director = useDirector(`recording-camera:${itemId ?? 'shared'}`, mode)
   const feed = useCameraFeed(feedW, feedH, feedRate)
+  const multiview = useMultiviewFeed(feedW, feedH, FEED.MULTIVIEW_FPS)
   const recorder = useRecorder(recordFps ?? preset.fps)
+
+  // 4 分割表示は閲覧者ごとの切り替え（同期しない）。同期すると他人の画面まで
+  // 分割されてしまい、単に自分の絵を見たかった人まで影響する
+  const [splitView, setSplitView] = useState(false)
 
   const viewfinder = useMemo(
     () => new Viewfinder(feedW, feedH),
@@ -229,6 +239,12 @@ export const Item = ({
         fov: 45,
         roll: 0,
       } as ShotPose,
+      /** マルチビューの各チャンネル（CAM2〜4）の理想姿勢 */
+      channelPoses: [
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+      ] as ShotPose[],
       ctx: {
         t: 0,
         progress: 0,
@@ -249,6 +265,7 @@ export const Item = ({
         nowMs: 0,
         mode: 'AUTO',
         shotLabel: 'WS',
+        split: false,
         recording: false,
         recElapsedMs: 0,
         recSupported: true,
@@ -265,6 +282,7 @@ export const Item = ({
         primaryPinned: false,
       } as HudModel,
       hidden: [] as Group[],
+      hiddenChannel: [] as Group[],
       first: true,
     }),
     [feedW, feedH, range, minAltitude, maxAltitude, tracker.facing],
@@ -280,6 +298,7 @@ export const Item = ({
         chips: CAMERA_MODES.map((_, i) => ui.atlas.slot(SLOT.chip + i)),
         prev: ui.atlas.slot(SLOT.prev),
         next: ui.atlas.slot(SLOT.next),
+        view: ui.atlas.slot(SLOT.view),
       },
     }),
     [ui],
@@ -344,7 +363,12 @@ export const Item = ({
     if (shot?.frameAll) correctFraming(ctx, work.desired)
 
     // --- ドローンを飛ばす ------------------------------------------------
-    rig.update(work.desired, dt, tSec, isPreview ? 0 : handheld, work.first)
+    // ハードカットが指定されているカットでは、カットの瞬間だけカメラを
+    // 理想姿勢へ一瞬で送る（機体は飛んで移動する。絵が入れ替わるだけ）。
+    // director.consumeSnap はディレクター役でカットを決めたクライアントだけが
+    // true を受け取るので、全員の画面で一斉に同じ瞬間へ切り替わる
+    const hardCut = !isPreview && director.transition === 'cut' && director.consumeSnap()
+    rig.update(work.desired, dt, tSec, isPreview ? 0 : handheld, work.first || hardCut)
     work.first = false
 
     const droneRoot = droneRefs.root.current
@@ -413,6 +437,13 @@ export const Item = ({
       focusMoving ? '#ffc454' : '#7fe9ff',
       focusMotion,
     )
+    ui.transitionPanel.set(
+      director.uiTransition === 'cut' ? '● カット: 瞬時切替' : '● カット: 飛んで移動',
+      director.uiTransition === 'cut'
+        ? '切り替えは一瞬。機体は移動を続ける'
+        : 'カットのたびに機体が飛んで移動する',
+      director.uiTransition === 'cut' ? '#7fe9ff' : '#ffb24d',
+    )
 
     if (isPreview) {
       ui.status.set('CINE DRONE', 'PLACE TO ACTIVATE', '#7fe9ff')
@@ -446,6 +477,7 @@ export const Item = ({
       far < 1 &&
       (gl.xr.isPresenting || monitorOnScreen(state.camera, monitorRef.current))
     const needFeed = recorder.recording || monitorVisible
+    const needMultiview = splitView && monitorVisible && !recorder.recording
 
     if (needFeed) {
       work.hidden.length = 0
@@ -454,11 +486,33 @@ export const Item = ({
       feed.render(gl, scene, work.hidden, now)
     }
 
+    // --- 4 分割マルチビュー -------------------------------------------------
+    // CAM1 はプログラム（メイン）の絵をそのまま、CAM2〜4 は主役以外を
+    // 決定論的に割り当てた仮想カメラ。機体は 1 台なので実体は増えない
+    if (needMultiview) {
+      const channels = assignChannels(director.primary, tracker.list)
+      for (let i = 0; i < work.channelPoses.length; i++) {
+        channelPose(channels[i], ctx, tSec, work.channelPoses[i])
+      }
+      work.hiddenChannel.length = 0
+      if (monitorRef.current) work.hiddenChannel.push(monitorRef.current)
+      multiview.render(
+        gl,
+        scene,
+        cam,
+        work.channelPoses,
+        work.hidden,
+        work.hiddenChannel,
+        now,
+      )
+    }
+
     // --- HUD -------------------------------------------------------------
     const hud = work.hud
     hud.nowMs = now
     hud.mode = MODE_LABEL[director.mode] ?? 'AUTO'
     hud.shotLabel = director.label
+    hud.split = splitView
     hud.recording = recorder.recording
     hud.recElapsedMs = recorder.elapsedMs
     hud.recSupported = recorder.supported
@@ -523,8 +577,9 @@ export const Item = ({
       {showMonitor && (
         <Monitor
           groupRef={monitorRef}
-          feed={feed.target.texture}
+          feed={splitView ? multiview.texture : feed.target.texture}
           hud={viewfinder.texture}
+          split={splitView}
           width={monitorWidth}
           height={(monitorWidth * feedH) / feedW}
           y={MONITOR_Y}
@@ -532,11 +587,16 @@ export const Item = ({
           controls={{
             idPrefix,
             mode: director.uiMode,
+            transition: director.uiTransition,
             labelMaterial: ui.labelMaterial,
             slots: atlasSlots.monitor,
             focusTexture: ui.focusPanel.texture,
+            transitionTexture: ui.transitionPanel.texture,
             onSelectMode: (m) => director.setMode(m),
             onFocusStep: (d) => director.focusStep(d),
+            onToggleSplit: () => setSplitView((v) => !v),
+            onToggleTransition: () =>
+              director.setTransition(director.uiTransition === 'cut' ? 'fly' : 'cut'),
           }}
         />
       )}

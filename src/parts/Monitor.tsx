@@ -1,7 +1,7 @@
 import { useEffect, useMemo, type RefObject } from 'react'
 import { Group, Material, MeshStandardMaterial, type Texture } from 'three'
 import { BillboardY } from '@xrift/world-components'
-import { CAMERA_MODES, type CameraMode } from '../camera/types'
+import { CAMERA_MODES, type CameraMode, type CutTransition } from '../camera/types'
 import type { AtlasSlot } from './canvasTexture'
 import { labelQuad, mergeParts, partMatrix } from './mergeGeometry'
 import { PanelButton } from './PanelButton'
@@ -11,15 +11,23 @@ export interface MonitorControls {
   idPrefix: string
   /** 光らせる現在モード */
   mode: CameraMode
+  /** カットの切り替わり方。押すと fly ⇄ cut が入れ替わる */
+  transition: CutTransition
   /** 全ラベルが載った共通マテリアル（atlas） */
   labelMaterial: Material
-  /** チップ（CAMERA_MODES 順）と前後送りのコマ。identity が安定していること */
-  slots: { chips: AtlasSlot[]; prev: AtlasSlot; next: AtlasSlot }
+  /** チップ（CAMERA_MODES 順）と前後送り・4 分割ボタンのコマ。identity が安定していること */
+  slots: { chips: AtlasSlot[]; prev: AtlasSlot; next: AtlasSlot; view: AtlasSlot }
   /** 今フォーカスしている人の名前・状態・声量 */
   focusTexture: Texture
+  /** カットの切り替わり方の帯（瞬時 / 移動） */
+  transitionTexture: Texture
   onSelectMode(mode: CameraMode): void
   /** +1 で次の人、-1 で前の人 */
   onFocusStep(dir: number): void
+  /** モニタの 4 分割表示を切り替える（閲覧者ごと・同期しない） */
+  onToggleSplit(): void
+  /** カットの切り替わり方を fly ⇄ cut で入れ替える（インスタンス全体に同期） */
+  onToggleTransition(): void
 }
 
 export interface MonitorProps {
@@ -27,6 +35,8 @@ export interface MonitorProps {
   groupRef: RefObject<Group | null>
   feed: Texture
   hud: Texture
+  /** 4 分割表示中。枠線とチャンネル名を重ねる */
+  split?: boolean
   width?: number
   height?: number
   /** 台座からの高さ */
@@ -68,6 +78,7 @@ export const Monitor = ({
   groupRef,
   feed,
   hud,
+  split = false,
   width = 1.5,
   height = 1.5 * (9 / 16),
   y = 1.55,
@@ -94,7 +105,14 @@ export const Monitor = ({
       emissiveIntensity: 0.85,
       roughness: 0.4,
     })
-    return { bezel, chip, chipOn }
+    // fly（飛んで移動）モード中のトランジションチップ
+    const chipFly = new MeshStandardMaterial({
+      color: '#2b2413',
+      emissive: '#ffb24d',
+      emissiveIntensity: 0.55,
+      roughness: 0.4,
+    })
+    return { bezel, chip, chipOn, chipFly }
   }, [])
 
   useEffect(
@@ -102,6 +120,7 @@ export const Monitor = ({
       materials.bezel.dispose()
       materials.chip.dispose()
       materials.chipOn.dispose()
+      materials.chipFly.dispose()
     },
     [materials],
   )
@@ -109,11 +128,14 @@ export const Monitor = ({
   const outerW = width + 0.07
   const bezelBottom = -(height + 0.07) / 2
   const chipY = bezelBottom - 0.022 - CHIP_H / 2
-  const focusY = chipY - CHIP_H / 2 - 0.02 - FOCUS_H / 2
+  const viewY = chipY - CHIP_H / 2 - 0.018 - CHIP_H / 2
+  const focusY = viewY - CHIP_H / 2 - 0.02 - FOCUS_H / 2
   const chipW = (outerW - CHIP_GAP * (CAMERA_MODES.length - 1)) / CAMERA_MODES.length
   const focusW = outerW - STEP_W * 2 - 0.044
   const stepX = outerW / 2 - STEP_W / 2
   const chipX = (i: number) => -outerW / 2 + chipW / 2 + i * (chipW + CHIP_GAP)
+  /** 2 段目（4 分割 / 切替）の左右ボタン幅。中央の帯と同じ寸法 */
+  const viewSideW = STEP_W * 1.15
 
   const slots = controls?.slots
   const labelGeometry = useMemo(() => {
@@ -143,8 +165,16 @@ export const Monitor = ({
         partMatrix([outerW / 2 - STEP_W / 2, focusY, LABEL_Z]),
       ),
     })
+    parts.push({
+      geometry: labelQuad(
+        viewSideW * 0.92,
+        CHIP_H * 0.86,
+        slots.view,
+        partMatrix([-(outerW / 2 - viewSideW / 2), viewY, LABEL_Z]),
+      ),
+    })
     return mergeParts(parts, true)
-  }, [slots, outerW, chipW, chipY, focusY])
+  }, [slots, outerW, chipW, chipY, viewY, focusY])
 
   useEffect(() => () => labelGeometry?.dispose(), [labelGeometry])
 
@@ -158,6 +188,19 @@ export const Monitor = ({
         <planeGeometry args={[width, height]} />
         <meshBasicMaterial map={feed} toneMapped={false} />
       </mesh>
+      {/* 4 分割中の区切り線。チャンネル名は HUD 側でなくここに置く（静的でよい） */}
+      {split && (
+        <group position={[0, 0, 0.021]}>
+          <mesh>
+            <planeGeometry args={[width, 0.008]} />
+            <meshBasicMaterial color="#0a0d10" toneMapped={false} />
+          </mesh>
+          <mesh rotation={[0, 0, Math.PI / 2]}>
+            <planeGeometry args={[width, 0.004]} />
+            <meshBasicMaterial color="#0a0d10" toneMapped={false} />
+          </mesh>
+        </group>
+      )}
       {/* HUD */}
       <mesh position={[0, 0, 0.0215]}>
         <planeGeometry args={[width, height]} />
@@ -178,6 +221,35 @@ export const Monitor = ({
               material={controls.mode === m ? materials.chipOn : materials.chip}
             />
           ))}
+
+          {/* 2 段目: 4 分割トグルと、カットの切り替わり方。押すと何になるかは
+              ラベル（MODE 行の右）とボタン光で示す */}
+          <PanelButton
+            id={`${controls.idPrefix}-view-split`}
+            hint={split ? '1 画面に戻す' : '4 分割で全カメラを見る'}
+            onPress={() => controls.onToggleSplit()}
+            position={[-(outerW / 2 - viewSideW / 2), viewY, 0.018]}
+            size={[viewSideW, CHIP_H, CHIP_D]}
+            material={split ? materials.chipOn : materials.chip}
+          />
+          <PanelButton
+            id={`${controls.idPrefix}-transition`}
+            hint={
+              controls.transition === 'cut'
+                ? 'カットを飛んで移動に戻す'
+                : 'カットを瞬時切り替えにする'
+            }
+            onPress={() => controls.onToggleTransition()}
+            position={[outerW / 2 - viewSideW / 2, viewY, 0.018]}
+            size={[viewSideW, CHIP_H, CHIP_D]}
+            material={
+              controls.transition === 'cut' ? materials.chipOn : materials.chipFly
+            }
+          />
+          <mesh position={[0, viewY, 0.02]}>
+            <planeGeometry args={[focusW, CHIP_H]} />
+            <meshBasicMaterial map={controls.transitionTexture} transparent toneMapped={false} />
+          </mesh>
 
           {/* フォーカスしている人と、その送り */}
           <PanelButton

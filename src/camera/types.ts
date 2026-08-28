@@ -101,6 +101,13 @@ export interface ShotPose {
   roll: number
 }
 
+/** カットの切り替わり方 */
+export type CutTransition =
+  /** 機体が飛んで移動する（既定の従来挙動） */
+  | 'fly'
+  /** 絵だけ瞬時に入れ替わる（放送カメラのハードカット） */
+  | 'cut'
+
 /** インスタンス全体で同期されるディレクターの状態 */
 export interface DirectorState {
   /** 現在のショット ID */
@@ -114,6 +121,8 @@ export interface DirectorState {
   /** 決定論的な動きのためのシード */
   seed: number
   mode: CameraMode
+  /** カットの切り替わり方 */
+  transition: CutTransition
   /** PIN モードで指名されているユーザー ID。空文字で未指名 */
   pinned: string
   /** 更新カウンタ（デバッグ用） */
