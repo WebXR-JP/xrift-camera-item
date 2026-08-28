@@ -1,0 +1,8 @@
+# 改行は LF で正規化する（Windows / macOS が混ざっても差分が出ないように）
+* text=auto eol=lf
+
+# バイナリ
+*.png binary
+*.jpg binary
+*.webm binary
+*.zip binary

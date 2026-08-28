@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+
+# Build
+dist
+
+# Environment
+.env
+.env.*
+
+# Editor / ローカルのツール設定
+.vscode
+.idea
+.claude
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ログ
+*.log
+
+# XRift CLI が作るアップロード先の情報（item id など、環境ごとの状態）
+.xrift
+
+# 開発時のスクリーンショット（dev-headless.html から出力）
+.dev-shots
+
+# 手元で固めたソースの zip（リポジトリと中身が重複する）
+*.zip
+
+# 作り直し用の作業メモ（公開リポジトリには不要）
+REBUILD-PROMPT.md

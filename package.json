@@ -1,0 +1,56 @@
+{
+  "name": "@xrift/recording-camera",
+  "version": "0.1.0",
+  "description": "Autonomous cinematic drone camera for XRift: multi-user tracking, WebAudio speaker detection, live monitor and webm recording",
+  "type": "module",
+  "main": "./dist/remoteEntry.js",
+  "module": "./dist/remoteEntry.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/remoteEntry.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite --port 5199",
+    "build": "tsc && vite build",
+    "preview": "vite preview --port 5199",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@react-three/drei": "^10.7.3",
+    "@react-three/fiber": "^9.3.0",
+    "@react-three/rapier": "^2.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.183.1"
+  },
+  "devDependencies": {
+    "@originjs/vite-plugin-federation": "^1.4.1",
+    "@react-three/drei": "^10.7.7",
+    "@react-three/fiber": "^9.5.0",
+    "@react-three/rapier": "^2.2.0",
+    "@react-three/uikit": "^1.0.64",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.183.1",
+    "@vitejs/plugin-react": "^5.1.4",
+    "baseline-browser-mapping": "^2.10.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "three": "^0.183.1",
+    "typescript": "^5.6.2",
+    "vite": "^7.3.1",
+    "vite-plugin-dts": "^4.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@xrift/world-components": "^0.47.0"
+  }
+}
