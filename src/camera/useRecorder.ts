@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { WebGLRenderer } from 'three'
-import type { CameraFeed } from './useCameraFeed'
 import { createMp4Session, mp4SupportedSync, type Mp4Session } from './mp4Recorder'
 
 // 音声トラックは載せないので、コンテナにも音声コーデックを宣言しない。
@@ -62,6 +61,15 @@ const stamp = (): string => {
   )
 }
 
+export interface RecordSource {
+  /** 録るレンダーターゲット（CAM1 単独、または 4 分割マルチビュー） */
+  target: { width: number; height: number }
+  readPixels(
+    gl: WebGLRenderer,
+    buf: Uint8Array,
+  ): Promise<void> | void
+}
+
 export interface Recorder {
   supported: boolean
   /** 今の環境で録画が mp4 になるか（false なら webm） */
@@ -74,10 +82,15 @@ export interface Recorder {
    * ボイスチャットの音を取るにはプラットフォームの音声グラフを覗くか
    * navigator.mediaDevices が要るが、どちらもやらない方針にした。
    */
-  toggle(feed: CameraFeed): void
+  toggle(source: RecordSource): void
   stop(): void
   /** 録画中だけ、GPU から読み戻して HUD と合成する */
-  tick(gl: WebGLRenderer, feed: CameraFeed, hud: HTMLCanvasElement | null, nowMs: number): void
+  tick(
+    gl: WebGLRenderer,
+    source: RecordSource,
+    hud: HTMLCanvasElement | null,
+    nowMs: number,
+  ): void
   dispose(): void
 }
 
@@ -187,7 +200,7 @@ export const useRecorder = (fps: number): Recorder => {
       elapsedMs: 0,
       error: null,
 
-      toggle: (feed) => {
+      toggle: (source) => {
         if (api.recording) {
           api.stop()
           return
@@ -196,7 +209,7 @@ export const useRecorder = (fps: number): Recorder => {
           api.error = 'MediaRecorder unavailable'
           return
         }
-        if (!ensureCanvases(feed.width, feed.height)) {
+        if (!ensureCanvases(source.target.width, source.target.height)) {
           api.error = 'canvas 2d unavailable'
           return
         }
@@ -205,7 +218,7 @@ export const useRecorder = (fps: number): Recorder => {
         api.error = null
 
         if (mode === 'mp4-webcodecs') {
-          const session = createMp4Session(feed.width, feed.height, fps)
+          const session = createMp4Session(source.target.width, source.target.height, fps)
           if (!session) {
             api.error = 'WebCodecs unavailable'
             api.recording = false
@@ -252,24 +265,13 @@ export const useRecorder = (fps: number): Recorder => {
         recorder = null
       },
 
-      tick: (gl, feed, hud, nowMs) => {
+      tick: (gl, source, hud, nowMs) => {
         if (!api.recording || !outCtx || !rawCtx || !image || !buffer || !out) return
         api.elapsedMs = performance.now() - startedAt
 
         const interval = 1000 / Math.max(1, fps)
         if (nowMs - lastGrabAt < interval || inFlight) return
         lastGrabAt = nowMs
-
-        const anyGl = gl as unknown as {
-          readRenderTargetPixelsAsync?: (
-            rt: unknown,
-            x: number,
-            y: number,
-            w: number,
-            h: number,
-            buf: Uint8Array,
-          ) => Promise<unknown>
-        }
 
         const compose = () => {
           if (!outCtx || !rawCtx || !image || !buffer || !out) return
@@ -288,10 +290,10 @@ export const useRecorder = (fps: number): Recorder => {
         }
 
         try {
-          if (typeof anyGl.readRenderTargetPixelsAsync === 'function') {
+          const p = source.readPixels(gl, buffer)
+          if (p && typeof (p as Promise<void>).then === 'function') {
             inFlight = true
-            anyGl
-              .readRenderTargetPixelsAsync(feed.target, 0, 0, feed.width, feed.height, buffer)
+            ;(p as Promise<void>)
               .then(() => {
                 inFlight = false
                 compose()
@@ -300,7 +302,6 @@ export const useRecorder = (fps: number): Recorder => {
                 inFlight = false
               })
           } else {
-            gl.readRenderTargetPixels(feed.target, 0, 0, feed.width, feed.height, buffer)
             compose()
           }
         } catch (e) {

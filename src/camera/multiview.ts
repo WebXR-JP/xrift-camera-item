@@ -3,77 +3,36 @@ import {
   LinearFilter,
   Object3D,
   PerspectiveCamera,
-  Quaternion,
   Scene,
   Vector3,
   WebGLRenderTarget,
   type Texture,
   type WebGLRenderer,
 } from 'three'
-import type { ShotPose } from './types'
+import type { ShotPose, Subject } from './types'
 
 /**
  * モニタ用の 4 分割マルチビュー。
  *
- * チャンネルは「このドローンに載っている別のレンズ」。
- * 機体は 1 台のまま、gimbal の主力カメラ（CAM1）のほかに
- * 望遠・広角・機腹の俯瞰カメラが載っている体で、同じ位置から別の画を作る。
- * 絵は全部リグの現在姿勢から計算されるので同期項目は不要で、全員の画面で同じ分割になる。
+ * このアイテムは「1 機のメインドローン + 3 機のウィングドローン」で構成される。
+ * CAM1 はメイン機のプログラム絵、CAM2〜4 はそれぞれ別の参加者を担当中の
+ * ウィング機の視点。ウィング機の機体・リグ・被写体の割り当ては Item 側が持ち、
+ * ここは「4 台ぶんの絵を 1 枚のレンダーターゲットに並べる」ことだけを担当する。
  *
- * 録画はあくまで CAM1（プログラム）の 1 系統で、マルチビューは録られない。
+ * 録画はモニタに映っている系統（CAM1 またはこの 4 分割）をそのまま落とす。
  */
 
-export interface DroneLensInput {
-  /** メインカメラ（CAM1）のワールド位置 */
-  pos: Vector3
-  /** メインカメラの向き */
-  quat: Quaternion
-}
-
-/** TEL: 望遠。メインと同じ向きを寄って撮る */
-const TEL_FOV = 20
-/** WIDE: 広角。メインよりずっと広く */
-const WIDE_FOV = 96
-/** TOP: 機腹の俯瞰カメラ。真下ではなく前方へ寝かせて落とす（真下だと up が定まらない） */
-const TOP_FOV = 58
-const TOP_PITCH_DIST = 1.5
-const TOP_DROP = 2.8
-
-const fwd = new Vector3()
-
-/**
- * 機体搭載レンズ CAM2〜4 の理想姿勢を out[0..2] へ書く。
- * 位置は CAM1 と共有（同じ機体に載っている）なので、絵の違いは画角と俯瞰だけ。
- */
-export const lensPoses = (main: DroneLensInput, out: ShotPose[]): void => {
-  fwd.set(0, 0, -1).applyQuaternion(main.quat)
-  fwd.y = 0
-  if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1)
-  fwd.normalize()
-
-  for (let i = 0; i < out.length; i++) {
-    const p = out[i]
-    if (i === 0) {
-      // CAM2 TEL — メインと同じ軸の望遠レンズ
-      p.pos.copy(main.pos)
-      p.look.copy(main.pos).addScaledVector(fwd, 10)
-      p.fov = TEL_FOV
-      p.roll = 0
-    } else if (i === 1) {
-      // CAM3 WIDE — 周囲込みで掻っさらう広角レンズ
-      p.pos.copy(main.pos)
-      p.look.copy(main.pos).addScaledVector(fwd, 4)
-      p.fov = WIDE_FOV
-      p.roll = 0
-    } else {
-      // CAM4 TOP — 機腹の俯瞰。前方斜め下を見下ろす
-      p.pos.copy(main.pos)
-      p.look.copy(main.pos).addScaledVector(fwd, TOP_PITCH_DIST)
-      p.look.y -= TOP_DROP
-      p.fov = TOP_FOV
-      p.roll = 0
-    }
-  }
+/** 4 分割の CAM2〜4 に割り当てる被写体。主役を除いた人を ID 昇順で並べ、
+ *  足りないぶんは重複して埋める（全員の画面で同じ割り当てになる） */
+export const assignChannels = (
+  primary: Subject | null,
+  all: Subject[],
+): [Subject | null, Subject | null, Subject | null] => {
+  const rest = all
+    .filter((s) => s !== primary)
+    .sort((a, b) => (a.id < b.id ? -1 : 1))
+  const pick = (i: number): Subject | null => rest[i] ?? rest[0] ?? primary ?? null
+  return [pick(0), pick(1), pick(2)]
 }
 
 export interface MultiviewFeed {
@@ -86,16 +45,19 @@ export interface MultiviewFeed {
   dirty: boolean
   /**
    * 1 枚のレンダーターゲットに 4 つのビューポートを描き分ける。
-   * poses は [CAM2 TEL, CAM3 WIDE, CAM4 TOP]（CAM1 は programCam をそのまま使う）。
-   * hidden は全チャンネルで消すもの（モニタと機体。カメラと機体が同位置のため、
-   * 消さないとレンズ自身が画を塞いでしまう）。
+   * poses は [CAM2, CAM3, CAM4]（CAM1 は programCam をそのまま使う）。
+   * hiddenAll は全チャンネルで消すもの（モニタとメイン機。CAM1 は機載カメラなので
+   * 自機が画を塞ぐ）。
+   * hiddenSelf は CAM2〜4 で「そのチャンネルを撮っている機体自身」。レンズを載せた
+   * 機体が自分の画に映り込まないよう、該当チャンネルの間だけ消す。
    */
   render(
     gl: WebGLRenderer,
     scene: Scene,
     programCam: PerspectiveCamera,
     poses: ShotPose[],
-    hidden: Object3D[],
+    hiddenAll: Object3D[],
+    hiddenSelf: (Object3D | null | undefined)[],
     nowMs: number,
   ): boolean
   dispose(): void
@@ -141,7 +103,7 @@ export const useMultiviewFeed = (
       fps,
       dirty: false,
 
-      render: (gl, scene, programCam, poses, hidden, nowMs) => {
+      render: (gl, scene, programCam, poses, hiddenAll, hiddenSelf, nowMs) => {
         const interval = 1000 / Math.max(1, api.fps)
         if (nowMs - lastRenderAt < interval) {
           api.dirty = false
@@ -184,11 +146,17 @@ export const useMultiviewFeed = (
         // VR 中は gl.render が XR カメラを使ってしまうので、このパスの間だけ切る
         gl.xr.enabled = false
 
-        for (const [cam, x, y] of quads) {
+        for (let qi = 0; qi < quads.length; qi++) {
+          const [cam, x, y] = quads[qi]
+          const hideList = hiddenAll.slice()
+          if (qi > 0) {
+            const selfObj = hiddenSelf[qi - 1]
+            if (selfObj) hideList.push(selfObj)
+          }
           const restore: boolean[] = []
-          for (let i = 0; i < hidden.length; i++) {
-            restore.push(hidden[i].visible)
-            hidden[i].visible = false
+          for (let i = 0; i < hideList.length; i++) {
+            restore.push(hideList[i].visible)
+            hideList[i].visible = false
           }
           // ビューポートは gl.setViewport でなくレンダーターゲット側に直接書く。
           // gl.setViewport/gl.setScissor は値にウィンドウの pixelRatio を掛けて
@@ -199,7 +167,7 @@ export const useMultiviewFeed = (
           target.scissorTest = true
           gl.setRenderTarget(target)
           gl.render(scene, cam)
-          for (let i = 0; i < hidden.length; i++) hidden[i].visible = restore[i]
+          for (let i = 0; i < hideList.length; i++) hideList[i].visible = restore[i]
         }
 
         // 次にこのターゲットへ描く誰のためにも、領域を全面に戻しておく

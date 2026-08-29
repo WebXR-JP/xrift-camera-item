@@ -13,7 +13,7 @@ import {
   type Camera,
 } from 'three'
 
-import { Drone, useDroneRefs } from './parts/Drone'
+import { Drone, useDroneRefs, type DroneRefs } from './parts/Drone'
 import { Monitor } from './parts/Monitor'
 import { Dock } from './parts/Dock'
 import { PanelAtlas, TextPanel } from './parts/canvasTexture'
@@ -23,7 +23,8 @@ import { useSubjects } from './camera/useSubjects'
 import { useDirector } from './camera/useDirector'
 import { useDroneRig } from './camera/useDroneRig'
 import { useCameraFeed } from './camera/useCameraFeed'
-import { useMultiviewFeed, lensPoses } from './camera/multiview'
+import { useMultiviewFeed, assignChannels } from './camera/multiview'
+import { useWingRig, wingDesired } from './camera/wingRig'
 import { useRecorder } from './camera/useRecorder'
 import { useSafeClock, useSafeItemId, useSafePlacement } from './camera/platform'
 import { applySafety, correctFraming, parkPose, type ShotContext } from './camera/shots'
@@ -38,7 +39,7 @@ import {
 } from './camera/types'
 import { clamp, lerp } from './camera/math'
 import { FEED, FEED_QUALITY, MOTION, type FeedQuality } from './camera/constants'
-
+import type { RecordSource } from './camera/useRecorder'
 export interface ItemProps {
   position?: [number, number, number]
   rotation?: [number, number, number]
@@ -200,6 +201,9 @@ export const Item = ({
   const dockRef = useRef<Group>(null)
   const ringMat = useRef<MeshStandardMaterial | null>(null)
   const droneRefs = useDroneRefs()
+  /** ウィング機 3 機の見た目とリグ。4 分割 CAM2〜4 の実体 */
+  const wingRefs = [useDroneRefs(), useDroneRefs(), useDroneRefs()]
+  const wingRigs = [useWingRig(0), useWingRig(1), useWingRig(2)]
 
   const itemId = useSafeItemId()
   const clock = useSafeClock()
@@ -239,12 +243,7 @@ export const Item = ({
         fov: 45,
         roll: 0,
       } as ShotPose,
-      /** マルチビューの各チャンネル（CAM2〜4）の理想姿勢 */
-      channelPoses: [
-        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
-        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
-        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
-      ] as ShotPose[],
+      /** マルチビューの各チャンネル（CAM2〜4）の理想姿勢（work.wingPoses へ移行） */
       ctx: {
         t: 0,
         progress: 0,
@@ -282,6 +281,16 @@ export const Item = ({
         primaryPinned: false,
       } as HudModel,
       hidden: [] as Group[],
+      /** ウィング機の理想姿勢（CAM2〜4） */
+      wingPoses: [
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+        { pos: new Vector3(), look: new Vector3(), fov: 45, roll: 0 },
+      ] as ShotPose[],
+      /** 前フレームで CAM2〜4 が担当中だった被写体 ID。交代時にリグをリセットする */
+      wingSubjectIds: ['', '', ''],
+      /** ウィング機が担当中か（false なら台座まわりで待機） */
+      wingActive: [false, false, false],
       first: true,
     }),
     [feedW, feedH, range, minAltitude, maxAltitude, tracker.facing],
@@ -291,6 +300,61 @@ export const Item = ({
   const idPrefix = `recording-camera-${itemId ?? 'shared'}`
   /** 前フレームで見たディレクター状態の rev。変化したらカット（瞬時切替ならスナップ） */
   const lastRevRef = useRef(-1)
+
+  // 録画する対象。4 分割表示中はマルチビューターゲット、通常時は CAM1 をそのまま落とす。
+  // 録画開始は splitView の現在値で決まり、録画が終わるまで画角は固定される
+  const recSourceRef = useRef<{ main: RecordSource; split: RecordSource } | null>(null)
+  /** 録画開始時に 4 分割だったか。録画中もその系統を描き続けるために使う */
+  const recSplitRef = useRef(false)
+  const needMultiviewRef = useRef(false)
+  const recSource =
+    recSourceRef.current ??
+    (recSourceRef.current = {
+      main: {
+        target: feed.target,
+        readPixels: (gl, buf) => {
+          const anyGl = gl as unknown as {
+            readRenderTargetPixelsAsync?: (
+              rt: unknown,
+              x: number,
+              y: number,
+              w: number,
+              h: number,
+              b: Uint8Array,
+            ) => Promise<unknown>
+          }
+          const { target, width, height } = feed
+          if (typeof anyGl.readRenderTargetPixelsAsync === 'function') {
+            return anyGl
+              .readRenderTargetPixelsAsync(target, 0, 0, width, height, buf)
+              .then(() => {})
+          }
+          gl.readRenderTargetPixels(target, 0, 0, width, height, buf)
+        },
+      },
+      split: {
+        target: multiview.target,
+        readPixels: (gl, buf) => {
+          const anyGl = gl as unknown as {
+            readRenderTargetPixelsAsync?: (
+              rt: unknown,
+              x: number,
+              y: number,
+              w: number,
+              h: number,
+              b: Uint8Array,
+            ) => Promise<unknown>
+          }
+          const { target, width, height } = multiview
+          if (typeof anyGl.readRenderTargetPixelsAsync === 'function') {
+            return anyGl
+              .readRenderTargetPixelsAsync(target, 0, 0, width, height, buf)
+              .then(() => {})
+          }
+          gl.readRenderTargetPixels(target, 0, 0, width, height, buf)
+        },
+      },
+    })
   // ボタンの位置は動かないので、切り出し範囲は 1 回だけ作って使い回す
   const atlasSlots = useMemo(
     () => ({
@@ -480,7 +544,11 @@ export const Item = ({
       far < 1 &&
       (gl.xr.isPresenting || monitorOnScreen(state.camera, monitorRef.current))
     const needFeed = recorder.recording || monitorVisible
-    const needMultiview = splitView && monitorVisible && !recorder.recording
+    // 録画中は開始時に選んだ系統を維持する（途中でモニタの絵が切り替わっても
+    // 解像度が変わってエンコードが壊れないように）
+    const needMultiviewRec = splitView || (recorder.recording && recSplitRef.current)
+    const needMultiview = needMultiviewRec && monitorVisible
+    needMultiviewRef.current = needMultiview
 
     if (needFeed) {
       work.hidden.length = 0
@@ -489,19 +557,95 @@ export const Item = ({
       feed.render(gl, scene, work.hidden, now)
     }
 
-    // --- 4 分割マルチビュー -------------------------------------------------
-    // 機体に載っている別レンズ（望遠・広角・機腹俯瞰）を同じ位置から並べて描く。
-    // CAM1 がメインのプログラム絵。機体は 1 台のまま
-    if (needMultiview) {
-      const lensMain = {
-        pos: cam.position,
-        quat: cam.quaternion,
+    // --- ウィング機 3 機の動きと担当者決定 ----------------------------------
+    // CAM2〜4 はウィング機 3 機の視点。各機は主役以外の参加者を 1 人ずつ担当中。
+    // 割り当ては参加者 ID から決定論的に決まるので全員の画面で同じ分割になる。
+    // 機体の位置は 3D 側でも動くので、離脱時は台座へ帰っていく姿が見える
+    const wings = needMultiviewRec || work.wingActive[0] || work.wingActive[1] || work.wingActive[2]
+      ? assignChannels(director.primary, tracker.list)
+      : null
+    if (wings && (needMultiviewRec || needFeed)) {
+      for (let i = 0; i < 3; i++) {
+        const s = wings[i]
+        const pose = work.wingPoses[i]
+        if (s) {
+          if (work.wingSubjectIds[i] !== s.id) {
+            work.wingSubjectIds[i] = s.id
+            wingDesired(s, i, tSec, pose)
+            wingRigs[i].reposition(pose)
+          } else {
+            wingDesired(s, i, tSec, pose)
+          }
+          applySafety(ctx, pose)
+        }
       }
-      lensPoses(lensMain, work.channelPoses)
+    } else if (!wings) {
+      work.wingSubjectIds = ['', '', '']
+    }
+
+    // --- ウィング機 3 機の 3D 上の位置 --------------------------------------
+    // 4 分割表示中（または録画中）はそれぞれの担当者のまわりへ飛び、
+    // それ以外は台座の上で待機する
+    root.getWorldQuaternion(parentQuat)
+    for (let i = 0; i < 3; i++) {
+      const wr = wingRefs[i].root.current
+      if (!wr) continue
+      const wrig = wingRigs[i]
+      const active = needMultiviewRec
+      if (active) {
+        if (!work.wingActive[i]) {
+          // 待機から投入されるフレームは担当地へ一瞬で移動する（発進）
+          wingRigs[i].reposition(work.wingPoses[i])
+          work.wingActive[i] = true
+        } else {
+          wrig.update(work.wingPoses[i], dt, tSec)
+        }
+        wr.position.copy(wrig.pos)
+        root.worldToLocal(wr.position)
+        const lq = parentQuat.clone().invert().multiply(wrig.bodyQuat)
+        wr.quaternion.copy(lq)
+      } else {
+        work.wingActive[i] = false
+        work.wingSubjectIds[i] = ''
+        // 待機位置: 台座のまわりに三角形に並んで低空ホバリング
+        const a = (i / 3) * Math.PI * 2 + tSec * 0.12
+        wr.position.set(
+          originVec.x + Math.sin(a) * 1.35,
+          originVec.y + 0.55 + Math.sin(tSec * 1.1 + i * 1.7) * 0.06,
+          originVec.z + Math.cos(a) * 1.35,
+        )
+        root.worldToLocal(wr.position)
+        wr.quaternion.copy(parentQuat).invert()
+      }
+      const wrefs = wingRefs[i]
+      const spinW = wrig.rotorAngle
+      for (let r = 0; r < wrefs.rotors.length; r++) {
+        const rotor = wrefs.rotors[r].current
+        if (rotor) rotor.rotation.y = r % 2 === 0 ? spinW : -spinW
+      }
+      if (wrefs.tallyMat.current) {
+        wrefs.tallyMat.current.emissiveIntensity = active
+          ? 0.35 + (recorder.recording ? 0.4 : 0)
+          : 0.12
+      }
+    }
+
+    // --- 4 分割マルチビューの描画 -------------------------------------------
+    // モニタが見えているときだけレンダリング。各チャンネルの間、そのチャンネルを
+    // 撮っているウィング機自身を消す（レンズが自機の画に映り込まないように）
+    if (needMultiview) {
       work.hidden.length = 0
       if (monitorRef.current) work.hidden.push(monitorRef.current)
       if (droneRoot) work.hidden.push(droneRoot)
-      multiview.render(gl, scene, cam, work.channelPoses, work.hidden, now)
+      multiview.render(
+        gl,
+        scene,
+        cam,
+        work.wingPoses,
+        work.hidden,
+        [wingRefs[0].root.current, wingRefs[1].root.current, wingRefs[2].root.current],
+        now,
+      )
     }
 
     // --- HUD -------------------------------------------------------------
@@ -550,7 +694,12 @@ export const Item = ({
     )
 
     // --- 録画 -------------------------------------------------------------
-    recorder.tick(gl, feed, viewfinder.canvas, now)
+    recorder.tick(
+      gl,
+      recSplitRef.current ? recSource.split : recSource.main,
+      viewfinder.canvas,
+      now,
+    )
   })
 
   return (
@@ -563,10 +712,21 @@ export const Item = ({
         labelSlots={atlasSlots.dock}
         recSupported={recorder.supported}
         ringRef={ringMat}
-        onRec={() => recorder.toggle(feed)}
+        onRec={() => {
+          if (!recorder.recording) {
+            // 開始時点の表示モードを録画系統として確定させる
+            recSplitRef.current = needMultiviewRef.current || splitView
+          }
+          recorder.toggle(recSplitRef.current ? recSource.split : recSource.main)
+        }}
       />
 
       <Drone refs={droneRefs} shadows={shadows} />
+
+      {/* ウィング機 3 機。普段は台座の上で待機し、4 分割モードで飛び立つ */}
+      {wingRefs.map((wr, i) => (
+        <WingUnit key={i} refs={wr} shadows={shadows} />
+      ))}
 
       {showMonitor && (
         <Monitor
@@ -597,6 +757,14 @@ export const Item = ({
     </group>
   )
 }
+
+/**
+ * ウィング機の見た目。メイン機と同じ Drone を使い回し、位置は useFrame 側で
+ * リグに合わせて書き込む。4 分割モード以外では台座の上に小さく止まっている。
+ */
+const WingUnit = ({ refs, shadows }: { refs: DroneRefs; shadows: boolean }) => (
+  <Drone refs={refs} scale={0.82} shadows={shadows} />
+)
 
 /**
  * 被写体をビューファインダ座標（0..1）に落とす。
