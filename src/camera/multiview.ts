@@ -190,14 +190,22 @@ export const useMultiviewFeed = (
             restore.push(hidden[i].visible)
             hidden[i].visible = false
           }
+          // ビューポートは gl.setViewport でなくレンダーターゲット側に直接書く。
+          // gl.setViewport/gl.setScissor は値にウィンドウの pixelRatio を掛けて
+          // しまうため、オフスクリーンでは DPR≠1 の環境で領域がズレて
+          // 1 チャンネルが画面全体を覆ってしまう
+          target.viewport.set(x, y, quadW, quadH)
+          target.scissor.set(x, y, quadW, quadH)
+          target.scissorTest = true
           gl.setRenderTarget(target)
-          gl.setViewport(x, y, quadW, quadH)
-          gl.setScissor(x, y, quadW, quadH)
-          gl.setScissorTest(true)
           gl.render(scene, cam)
-          gl.setScissorTest(false)
           for (let i = 0; i < hidden.length; i++) hidden[i].visible = restore[i]
         }
+
+        // 次にこのターゲットへ描く誰のためにも、領域を全面に戻しておく
+        target.viewport.set(0, 0, width, height)
+        target.scissor.set(0, 0, width, height)
+        target.scissorTest = false
 
         gl.setRenderTarget(prevTarget)
         gl.xr.enabled = prevXr
