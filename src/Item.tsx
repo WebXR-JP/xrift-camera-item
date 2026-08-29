@@ -23,7 +23,7 @@ import { useSubjects } from './camera/useSubjects'
 import { useDirector } from './camera/useDirector'
 import { useDroneRig } from './camera/useDroneRig'
 import { useCameraFeed } from './camera/useCameraFeed'
-import { useMultiviewFeed, assignChannels, channelPose } from './camera/multiview'
+import { useMultiviewFeed, lensPoses } from './camera/multiview'
 import { useRecorder } from './camera/useRecorder'
 import { useSafeClock, useSafeItemId, useSafePlacement } from './camera/platform'
 import { applySafety, correctFraming, parkPose, type ShotContext } from './camera/shots'
@@ -282,7 +282,6 @@ export const Item = ({
         primaryPinned: false,
       } as HudModel,
       hidden: [] as Group[],
-      hiddenChannel: [] as Group[],
       first: true,
     }),
     [feedW, feedH, range, minAltitude, maxAltitude, tracker.facing],
@@ -290,10 +289,12 @@ export const Item = ({
 
   const isPreview = placement === 'preview'
   const idPrefix = `recording-camera-${itemId ?? 'shared'}`
+  /** 前フレームで見たディレクター状態の rev。変化したらカット（瞬時切替ならスナップ） */
+  const lastRevRef = useRef(-1)
   // ボタンの位置は動かないので、切り出し範囲は 1 回だけ作って使い回す
   const atlasSlots = useMemo(
     () => ({
-      dock: [SLOT.mode, SLOT.next, SLOT.cut, SLOT.rec].map((i) => ui.atlas.slot(i)),
+      dock: [SLOT.rec, SLOT.mode, SLOT.cut, SLOT.next].map((i) => ui.atlas.slot(i)),
       monitor: {
         chips: CAMERA_MODES.map((_, i) => ui.atlas.slot(SLOT.chip + i)),
         prev: ui.atlas.slot(SLOT.prev),
@@ -363,11 +364,13 @@ export const Item = ({
     if (shot?.frameAll) correctFraming(ctx, work.desired)
 
     // --- ドローンを飛ばす ------------------------------------------------
-    // ハードカットが指定されているカットでは、カットの瞬間だけカメラを
-    // 理想姿勢へ一瞬で送る（機体は飛んで移動する。絵が入れ替わるだけ）。
-    // director.consumeSnap はディレクター役でカットを決めたクライアントだけが
-    // true を受け取るので、全員の画面で一斉に同じ瞬間へ切り替わる
-    const hardCut = !isPreview && director.transition === 'cut' && director.consumeSnap()
+    // 瞬時切替（cut）モードでは、カットの瞬間にカメラだけが理想姿勢へ一瞬で送られる
+    // （機体は飛んで移動を続ける。絵が入れ替わるだけ）。
+    // カット情報（rev）は useInstanceState で全員に同期されるので、
+    // rev 変化を検知した全クライアントが同じフレームで一斉にスナップする
+    const revChanged = !isPreview && director.rev !== lastRevRef.current
+    if (revChanged) lastRevRef.current = director.rev
+    const hardCut = !isPreview && director.transition === 'cut' && revChanged
     rig.update(work.desired, dt, tSec, isPreview ? 0 : handheld, work.first || hardCut)
     work.first = false
 
@@ -487,24 +490,18 @@ export const Item = ({
     }
 
     // --- 4 分割マルチビュー -------------------------------------------------
-    // CAM1 はプログラム（メイン）の絵をそのまま、CAM2〜4 は主役以外を
-    // 決定論的に割り当てた仮想カメラ。機体は 1 台なので実体は増えない
+    // 機体に載っている別レンズ（望遠・広角・機腹俯瞰）を同じ位置から並べて描く。
+    // CAM1 がメインのプログラム絵。機体は 1 台のまま
     if (needMultiview) {
-      const channels = assignChannels(director.primary, tracker.list)
-      for (let i = 0; i < work.channelPoses.length; i++) {
-        channelPose(channels[i], ctx, tSec, work.channelPoses[i])
+      const lensMain = {
+        pos: cam.position,
+        quat: cam.quaternion,
       }
-      work.hiddenChannel.length = 0
-      if (monitorRef.current) work.hiddenChannel.push(monitorRef.current)
-      multiview.render(
-        gl,
-        scene,
-        cam,
-        work.channelPoses,
-        work.hidden,
-        work.hiddenChannel,
-        now,
-      )
+      lensPoses(lensMain, work.channelPoses)
+      work.hidden.length = 0
+      if (monitorRef.current) work.hidden.push(monitorRef.current)
+      if (droneRoot) work.hidden.push(droneRoot)
+      multiview.render(gl, scene, cam, work.channelPoses, work.hidden, now)
     }
 
     // --- HUD -------------------------------------------------------------
@@ -566,9 +563,6 @@ export const Item = ({
         labelSlots={atlasSlots.dock}
         recSupported={recorder.supported}
         ringRef={ringMat}
-        onMode={() => director.cycleMode()}
-        onFocusNext={() => director.focusStep(1)}
-        onCut={() => director.cut()}
         onRec={() => recorder.toggle(feed)}
       />
 

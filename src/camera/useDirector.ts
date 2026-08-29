@@ -67,6 +67,8 @@ export interface Director {
    * Item 側は true が返ったフレームでカメラを理想姿勢へ一瞬で送る。
    */
   consumeSnap(): boolean
+  /** 現在のディレクター状態の更新カウンタ。カット・モード変更などで増える */
+  rev: number
   /** フレームに入れる被写体（先頭が主役） */
   cast: Subject[]
   primary: Subject | null
@@ -309,6 +311,7 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
       rnd: rndCache,
       elapsed: 0,
       cutFlash: 0,
+      rev: 0,
 
       setMode: (mode) => {
         const st = stateRef.current
@@ -365,6 +368,7 @@ export const useDirector = (stateKey: string, defaultMode: CameraMode): Director
         self.pinnedId = st.pinned || null
         self.isDirector = isDirectorRef.current
         self.transition = st.transition ?? 'fly'
+        self.rev = st.rev
         self.nextMode =
           CAMERA_MODES[(CAMERA_MODES.indexOf(st.mode) + 1) % CAMERA_MODES.length]
 

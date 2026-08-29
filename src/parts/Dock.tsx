@@ -16,29 +16,25 @@ export interface DockProps {
   statusTexture: Texture
   /** 全ボタンのラベルが載った共通マテリアル（atlas） */
   labelMaterial: Material
-  /** ボタンの並び順（MODE / NEXT / CUT / REC）に対応する atlas のコマ */
+  /** REC ボタンの atlas のコマ */
   labelSlots: AtlasSlot[]
-  onMode(): void
-  onFocusNext(): void
-  onCut(): void
   onRec(): void
   recSupported: boolean
   /** 台座リングのマテリアル（録画中に赤くする） */
   ringRef: { current: MeshStandardMaterial | null }
 }
 
-/** 前側の弧に並べる。角度（度）と、ボタンの中心までの半径 */
-const ARC_RADIUS = 0.47
-const ARC_ANGLES = [-39, -13, 13, 39]
-const BUTTON_SIZE: [number, number, number] = [0.2, 0.055, 0.145]
-const BUTTON_Y = 0.078
+/** 正面に置く REC ボタン。パッドの前側、ステータス画面が見える向きに置く */
+const BUTTON_POS: [number, number, number] = [0, 0.078, 0.42]
+const BUTTON_SIZE: [number, number, number] = [0.24, 0.055, 0.11]
 
 /**
- * 離着陸パッドと操作パネル。
+ * 離着陸パッドと REC ボタン。
  *
- * ボタンは「押すと何が起きるか」を面に書いてある（MODE なら現在のモードと
- * 切り替え先、REC なら録画中かどうか）。押してみないと分からない状態を残さない。
- * 中央は着陸スペースなので、ボタンは前側の弧に逃がしてある。
+ * 撮り方の操作（モード切替・フォーカス・カット）はモニタ下のパネルに集約した。
+ * 台座まで操作を置くと操作のたびモニタと台座を行き来することになるので、
+ * 台座側は録画の開始・停止だけを受け持つ。押すたび絵が大きく切り替わるのは
+ * モニタの前という「見ている人」の前だけでよい、という割り切り。
  */
 export const Dock = ({
   idPrefix,
@@ -46,9 +42,6 @@ export const Dock = ({
   statusTexture,
   labelMaterial,
   labelSlots,
-  onMode,
-  onFocusNext,
-  onCut,
   onRec,
   recSupported,
   ringRef,
@@ -75,21 +68,17 @@ export const Dock = ({
 
   const geometry = useMemo(() => {
     const [w, h, d] = BUTTON_SIZE
-    // ボタンの上面に寝かせるラベル。4 枚まとめて 1 メッシュ
-    const labels = mergeParts(
-      ARC_ANGLES.map((deg, i) => {
-        const a = (deg * Math.PI) / 180
-        const button = partMatrix(
-          [Math.sin(a) * ARC_RADIUS, BUTTON_Y, Math.cos(a) * ARC_RADIUS],
-          [0, a, 0],
-        )
-        const onTop = partMatrix([0, h / 2 + 0.0012, 0], [-Math.PI / 2, 0, 0])
-        return {
-          geometry: labelQuad(w * 0.92, d * 0.92, labelSlots[i], button.multiply(onTop)),
-        }
-      }),
-      true,
-    )
+    // REC ボタンの上面に寝かせたラベル。1 枚でよいので 1 メッシュ
+    const labels = mergeParts([
+      {
+        geometry: labelQuad(
+          w * 0.92,
+          d * 0.92,
+          labelSlots[0],
+          partMatrix(BUTTON_POS).multiply(partMatrix([0, h / 2 + 0.0012, 0], [-Math.PI / 2, 0, 0])),
+        ),
+      },
+    ], true)
     // 着陸マークの 2 本のリングも同じマテリアルなのでまとめる
     const rings = mergeParts([
       { geometry: new RingGeometry(0.3, 0.35, 32) },
@@ -116,25 +105,13 @@ export const Dock = ({
     }
   }, [materials, ringRef])
 
-  const buttons = [
-    { key: 'mode', hint: '撮り方を切り替える', onPress: onMode, on: true },
-    { key: 'focus', hint: '次の人にフォーカスする', onPress: onFocusNext, on: true },
-    { key: 'cut', hint: '次のカットへ切り替える', onPress: onCut, on: true },
-    {
-      key: 'rec',
-      hint: recSupported ? '録画の開始 / 停止（自分の端末に保存）' : 'この環境では録画できません',
-      onPress: onRec,
-      on: recSupported,
-    },
-  ]
-
   return (
     <group ref={groupRef}>
       {/* 離着陸パッド。床に置くものなので影は落とさない（受けるだけ） */}
       <mesh material={materials.pad} position={[0, 0.025, 0]} receiveShadow>
         <cylinderGeometry args={[0.62, 0.68, 0.05, 28]} />
       </mesh>
-      {/* 着陸マーク。ボタンの弧より内側に収める */}
+      {/* 着陸マーク。REC ボタンより内側に収める */}
       <mesh
         geometry={geometry.rings}
         material={materials.ring}
@@ -148,23 +125,16 @@ export const Dock = ({
         <meshBasicMaterial map={statusTexture} transparent toneMapped={false} />
       </mesh>
 
-      {/* 操作ボタン。文字は下の 1 メッシュがまとめて描く */}
-      {buttons.map((b, i) => {
-        const a = (ARC_ANGLES[i] * Math.PI) / 180
-        return (
-          <PanelButton
-            key={b.key}
-            id={`${idPrefix}-${b.key}`}
-            hint={b.hint}
-            enabled={b.on}
-            onPress={b.onPress}
-            position={[Math.sin(a) * ARC_RADIUS, BUTTON_Y, Math.cos(a) * ARC_RADIUS]}
-            rotation={[0, a, 0]}
-            size={BUTTON_SIZE}
-            material={materials.button}
-          />
-        )
-      })}
+      {/* REC ボタンだけ。それ以外の操作はモニタのパネルへ */}
+      <PanelButton
+        id={`${idPrefix}-rec`}
+        hint={recSupported ? '録画の開始 / 停止（自分の端末に保存）' : 'この環境では録画できません'}
+        enabled={recSupported}
+        onPress={onRec}
+        position={BUTTON_POS}
+        size={BUTTON_SIZE}
+        material={materials.button}
+      />
       <mesh geometry={geometry.labels} material={labelMaterial} />
     </group>
   )

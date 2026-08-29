@@ -3,127 +3,77 @@ import {
   LinearFilter,
   Object3D,
   PerspectiveCamera,
+  Quaternion,
   Scene,
   Vector3,
   WebGLRenderTarget,
   type Texture,
   type WebGLRenderer,
 } from 'three'
-import { applySafety, type ShotContext } from './shots'
 import type { ShotPose } from './types'
-import { fitDistance } from './math'
-import type { Subject } from './types'
 
 /**
  * モニタ用の 4 分割マルチビュー。
  *
- * CAM1 にメインのプログラム映像、CAM2〜4 に「主役以外の注目度上位の人」を
- * 決定論的に割り当てる。割り当てと絵はサーバ時計と参加者 ID だけから計算するので、
- * 全員の画面で同じ分割になる（新しい同期項目は不要）。
+ * チャンネルは「このドローンに載っている別のレンズ」。
+ * 機体は 1 台のまま、gimbal の主力カメラ（CAM1）のほかに
+ * 望遠・広角・機腹の俯瞰カメラが載っている体で、同じ位置から別の画を作る。
+ * 絵は全部リグの現在姿勢から計算されるので同期項目は不要で、全員の画面で同じ分割になる。
  *
- * 各チャンネルは実在する機体を持たない仮想カメラ。ドローンは 1 台のまま、
- * モニタだけ放送局のマルチビューモニタのように振る舞う。
  * 録画はあくまで CAM1（プログラム）の 1 系統で、マルチビューは録られない。
  */
 
-export type ChannelKind = 'cu' | 'orb' | 'ws'
-
-export interface ChannelSpec {
-  kind: ChannelKind
-  /** 撮る人。null なら全体画あるいは待機 */
-  subject: Subject | null
-  /** HUD に出すチャンネル名 */
-  label: string
+export interface DroneLensInput {
+  /** メインカメラ（CAM1）のワールド位置 */
+  pos: Vector3
+  /** メインカメラの向き */
+  quat: Quaternion
 }
+
+/** TEL: 望遠。メインと同じ向きを寄って撮る */
+const TEL_FOV = 20
+/** WIDE: 広角。メインよりずっと広く */
+const WIDE_FOV = 96
+/** TOP: 機腹の俯瞰カメラ。真下ではなく前方へ寝かせて落とす（真下だと up が定まらない） */
+const TOP_FOV = 58
+const TOP_PITCH_DIST = 1.5
+const TOP_DROP = 2.8
+
+const fwd = new Vector3()
 
 /**
- * チャンネルへの割り当て。主役を除いた人を ID 昇順で並べ、
- * CAM2 に CU、CAM3 に ORB、CAM4 は全体画を担う。人が足りなければ
- * 主役へのフォールバックで空きチャンネルを埋める。
+ * 機体搭載レンズ CAM2〜4 の理想姿勢を out[0..2] へ書く。
+ * 位置は CAM1 と共有（同じ機体に載っている）なので、絵の違いは画角と俯瞰だけ。
  */
-export const assignChannels = (
-  primary: Subject | null,
-  all: Subject[],
-): ChannelSpec[] => {
-  const pool = all.filter((s) => s !== primary).sort((a, b) => (a.id < b.id ? -1 : 1))
-  return [
-    { kind: 'cu', subject: pool[0] ?? primary, label: 'CAM2 CU' },
-    { kind: 'orb', subject: pool[1] ?? primary, label: 'CAM3 ORB' },
-    { kind: 'ws', subject: null, label: 'CAM4 WS' },
-  ]
-}
+export const lensPoses = (main: DroneLensInput, out: ShotPose[]): void => {
+  fwd.set(0, 0, -1).applyQuaternion(main.quat)
+  fwd.y = 0
+  if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1)
+  fwd.normalize()
 
-const vA = new Vector3()
-const vB = new Vector3()
-const vC = new Vector3()
-const vD = new Vector3()
-
-/** チャンネル 1 個ぶんの理想姿勢。tSec はサーバ時計起点の秒（決定論的） */
-export const channelPose = (
-  spec: ChannelSpec,
-  ctx: ShotContext,
-  tSec: number,
-  out: ShotPose,
-): void => {
-  const s = spec.subject ?? ctx.cast[0] ?? null
-
-  if (spec.kind === 'cu' && s) {
-    // 寄り。正面ど真ん中を避けて 32 度ずらした絶叫近距離
-    ctx.facing(s, vA)
-    const a = (32 * Math.PI) / 180
-    vB.set(
-      vA.x * Math.cos(a) - vA.z * Math.sin(a),
-      0,
-      vA.x * Math.sin(a) + vA.z * Math.cos(a),
-    )
-    out.pos.copy(s.head).addScaledVector(vB, 1.45)
-    out.pos.y = s.head.y + 0.03
-    out.look.copy(s.head)
-    out.look.y -= 0.05
-    out.fov = 34
-  } else if (spec.kind === 'orb' && s) {
-    // 回り込み。ゆっくり周回し続ける
-    vC.copy(s.chest)
-    const angle = tSec * 0.5 + 2.1
-    const dist = Math.max(2.2, fitDistance(0.6, 40, ctx.aspect, 1.35))
-    out.pos.set(
-      vC.x + Math.sin(angle) * dist,
-      vC.y + 0.35 + Math.sin(tSec * 0.33) * 0.15,
-      vC.z + Math.cos(angle) * dist,
-    )
-    out.look.copy(vC)
-    out.fov = 40
-  } else {
-    // 全体画（WS）。「その場の全員」を収める。誰も居なければ設置位置の周囲を眺める
-    const center = vD
-    let radius = ctx.radius
-    if (ctx.all.length > 0) {
-      center.set(0, 0, 0)
-      for (const p of ctx.all) center.add(p.chest)
-      center.multiplyScalar(1 / ctx.all.length)
-      let r = 0
-      for (const p of ctx.all) {
-        vB.subVectors(p.chest, center)
-        r = Math.max(r, vB.length() + p.height * 0.45)
-      }
-      radius = Math.max(0.75, r)
+  for (let i = 0; i < out.length; i++) {
+    const p = out[i]
+    if (i === 0) {
+      // CAM2 TEL — メインと同じ軸の望遠レンズ
+      p.pos.copy(main.pos)
+      p.look.copy(main.pos).addScaledVector(fwd, 10)
+      p.fov = TEL_FOV
+      p.roll = 0
+    } else if (i === 1) {
+      // CAM3 WIDE — 周囲込みで掻っさらう広角レンズ
+      p.pos.copy(main.pos)
+      p.look.copy(main.pos).addScaledVector(fwd, 4)
+      p.fov = WIDE_FOV
+      p.roll = 0
     } else {
-      center.set(ctx.origin.x, ctx.origin.y + 1.2, ctx.origin.z)
-      radius = 2
+      // CAM4 TOP — 機腹の俯瞰。前方斜め下を見下ろす
+      p.pos.copy(main.pos)
+      p.look.copy(main.pos).addScaledVector(fwd, TOP_PITCH_DIST)
+      p.look.y -= TOP_DROP
+      p.fov = TOP_FOV
+      p.roll = 0
     }
-    const angle = tSec * 0.05
-    const dist = fitDistance(radius, 42, ctx.aspect, 1.4)
-    out.pos.set(
-      center.x + Math.sin(angle) * dist,
-      center.y + radius * 0.5 + 1.6,
-      center.z + Math.cos(angle) * dist,
-    )
-    out.look.copy(center)
-    out.fov = 42
   }
-
-  out.roll = 0
-  applySafety(ctx, out)
 }
 
 export interface MultiviewFeed {
@@ -136,17 +86,16 @@ export interface MultiviewFeed {
   dirty: boolean
   /**
    * 1 枚のレンダーターゲットに 4 つのビューポートを描き分ける。
-   * poses は [CAM2, CAM3, CAM4]（CAM1 は programCam をそのまま使う）。
-   * hiddenProgram は CAM1 の間だけ消すもの（モニタと機体）、
-   * hiddenChannel は全チャンネルで消すもの（モニタ。機体は CAM2〜4 に映ってよい）。
+   * poses は [CAM2 TEL, CAM3 WIDE, CAM4 TOP]（CAM1 は programCam をそのまま使う）。
+   * hidden は全チャンネルで消すもの（モニタと機体。カメラと機体が同位置のため、
+   * 消さないとレンズ自身が画を塞いでしまう）。
    */
   render(
     gl: WebGLRenderer,
     scene: Scene,
     programCam: PerspectiveCamera,
     poses: ShotPose[],
-    hiddenProgram: Object3D[],
-    hiddenChannel: Object3D[],
+    hidden: Object3D[],
     nowMs: number,
   ): boolean
   dispose(): void
@@ -192,7 +141,7 @@ export const useMultiviewFeed = (
       fps,
       dirty: false,
 
-      render: (gl, scene, programCam, poses, hiddenProgram, hiddenChannel, nowMs) => {
+      render: (gl, scene, programCam, poses, hidden, nowMs) => {
         const interval = 1000 / Math.max(1, api.fps)
         if (nowMs - lastRenderAt < interval) {
           api.dirty = false
@@ -223,11 +172,11 @@ export const useMultiviewFeed = (
         const quadH = height / 2
 
         // 左上 / 右上 / 左下 / 右下。WebGL のビューポート原点は左下
-        const quads: [PerspectiveCamera, number, number, Object3D[]][] = [
-          [programCam, 0, quadH, hiddenProgram],
-          [cams[0], quadW, quadH, hiddenChannel],
-          [cams[1], 0, 0, hiddenChannel],
-          [cams[2], quadW, 0, hiddenChannel],
+        const quads: [PerspectiveCamera, number, number][] = [
+          [programCam, 0, quadH],
+          [cams[0], quadW, quadH],
+          [cams[1], 0, 0],
+          [cams[2], quadW, 0],
         ]
 
         const prevTarget = gl.getRenderTarget()
@@ -235,7 +184,7 @@ export const useMultiviewFeed = (
         // VR 中は gl.render が XR カメラを使ってしまうので、このパスの間だけ切る
         gl.xr.enabled = false
 
-        for (const [cam, x, y, hidden] of quads) {
+        for (const [cam, x, y] of quads) {
           const restore: boolean[] = []
           for (let i = 0; i < hidden.length; i++) {
             restore.push(hidden[i].visible)
